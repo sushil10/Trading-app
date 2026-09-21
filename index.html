@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<meta name="theme-color" content="#0a0a0a">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>TA — Trading Assistant</title>
+<link rel="manifest" href="data:application/json,{%22name%22:%22Trading%20Assistant%22,%22short_name%22:%22TA%22,%22start_url%22:%22.%22,%22display%22:%22standalone%22,%22background_color%22:%22%230a0a0a%22,%22theme_color%22:%22%2300e0a0%22,%22icons%22:[{%22src%22:%22data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect fill='%230a0a0a' width='100' height='100'/%3E%3Ctext x='50' y='65' font-size='50' text-anchor='middle' fill='%2300e0a0'%3E%E2%9A%A1%3C/text%3E%3C/svg%3E%22,%22sizes%22:%22192x192%22,%22type%22:%22image/svg+xml%22}]}">
+<style>
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{margin:0;background:#0a0a0a;color:#e0e0e0;font-family:-apple-system,system-ui,sans-serif;font-size:14px;padding-bottom:60px}
+.bar{display:flex;align-items:center;gap:8px;padding:10px;background:#121218;position:sticky;top:0;z-index:10;border-bottom:1px solid #222}
+.bar h1{margin:0;font-size:16px;color:#00e0a0}
+select,button,input{background:#1a1a20;color:#e0e0e0;border:1px solid #333;border-radius:6px;padding:8px 10px;font-size:13px;font-family:inherit}
+button{cursor:pointer;min-width:60px}
+button.on{background:#1f4d33;border-color:#2a6b48}
+button.off{background:#4d1f1f;border-color:#6b2a2a}
+.tabs{display:flex;background:#121218;position:sticky;top:57px;z-index:9;border-bottom:1px solid #222}
+.tab{flex:1;text-align:center;padding:10px;color:#888;font-size:13px;cursor:pointer}
+.tab.active{color:#00e0a0;border-bottom:2px solid #00e0a0}
+.list{padding:6px}
+.row{display:grid;grid-template-columns:52px 1fr 50px 55px 1fr 40px;gap:6px;padding:8px;background:#121218;border-radius:6px;margin-bottom:4px;font-size:12px;align-items:center}
+.row.buy{border-left:3px solid #00e0a0}
+.row.sell{border-left:3px solid #ff6060}
+.gb{border-left:3px solid #ffcc00;background:#1f1a0f}
+.log{font-family:ui-monospace,Menlo,monospace;font-size:11px;padding:8px;color:#00e0a0;white-space:pre-wrap;word-break:break-word;line-height:1.5}
+.log div{padding:2px 0;border-bottom:1px solid #111}
+.empty{text-align:center;color:#555;padding:40px;font-size:13px}
+.config{padding:10px;display:none}
+.config.show{display:block}
+.config label{display:block;margin:8px 0 4px;color:#00e0a0;font-size:12px}
+.config input{width:100%}
+.save{margin-top:12px;background:#1f4d33;border-color:#2a6b48;padding:10px;width:100%}
+</style>
+</head>
+<body>
+<div class="bar">
+  <h1>⚡ TA</h1>
+  <select id="broker">
+    <option value="none">none (paper)</option>
+    <option value="dhan">Dhan</option>
+    <option value="fyers">Fyers</option>
+  </select>
+  <button id="scanBtn" onclick="toggleScan()">▶ Scan</button>
+  <button onclick="toggleConfig()">⚙</button>
+</div>
+<div class="tabs">
+  <div class="tab active" onclick="tab('signals')">Signals</div>
+  <div class="tab" onclick="tab('gamma')">Gamma</div>
+  <div class="tab" onclick="tab('log')">Log</div>
+</div>
+
+<div id="pane-signals" class="pane">
+  <div id="signals" class="list"><div class="empty">No signals yet<br>Tap "Scan" to start</div></div>
+</div>
+<div id="pane-gamma" class="pane" style="display:none">
+  <div id="gammas" class="list"><div class="empty">Gamma blast alerts appear here</div></div>
+</div>
+<div id="pane-log" class="pane" style="display:none">
+  <div id="log" class="log"></div>
+</div>
+
+<div id="cfg" class="config">
+  <label>Telegram Bot Token</label>
+  <input id="cfg_token" placeholder="1234:ABC...">
+  <label>Telegram Chat ID</label>
+  <input id="cfg_chat" placeholder="123456789">
+  <label>Capital (₹)</label>
+  <input id="cfg_cap" type="number" value="100000">
+  <label>Scan interval (sec)</label>
+  <input id="cfg_int" type="number" value="60">
+  <button class="save" onclick="saveCfg()">Save</button>
+</div>
+
+<script>
+const DEFAULT_CFG = {
+  broker:"none",
+  watchlist:["NIFTY","BANKNIFTY","RELIANCE","TCS","HDFCBANK","INFY","SBIN","ICICIBANK","ITC","LT"],
+  capital:100000,
+  risk_pct:1.0,
+  min_conf:0.55,
+  cooldown_min:15,
+  tg_token:"", tg_chat:"",
+  gamma_start:"14:00",
+  interval:60
+};
+
+let CFG = Object.assign({}, DEFAULT_CFG, JSON.parse(localStorage.getItem("ta_cfg")||"{}"));
+let running = false;
+let scanTimer = null;
+let lastFire = {};
+let cache = {};
+
+// ---------- YF FETCH ----------
+const YF_MAP = {NIFTY:"^NSEI",BANKNIFTY:"^NSEBANK",FINNIFTY:"NIFTY_FIN_SERVICE.NS",SENSEX:"^BSESN"};
+
+async function fetchCandles(sym){
+  const yf = YF_MAP[sym] || (sym + ".NS");
+  const key = yf + "|5m|1d";
+  const now = Date.now();
+  if (cache[key] && (now - cache[key].t) < 55000) return cache[key].d;
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${yf}?interval=5m&range=1d`;
+  try {
+    const r = await fetch(url);
+    const j = await r.json();
+    const res = j.chart.result[0];
+    const ts = res.timestamp;
+    const q = res.indicators.quote[0];
+    const out = [];
+    for (let i=0;i<ts.length;i++){
+      const o=q.open[i],h=q.high[i],l=q.low[i],c=q.close[i],v=q.volume[i]||0;
+      if (o==null||h==null||l==null||c==null) continue;
+      out.push({t:ts[i],o,h,l,c,v});
+    }
+    cache[key] = {t:now, d:out};
+    return out;
+  } catch(e){ log("fetch fail "+sym+": "+e.message); return []; }
+}
+
+// ---------- INDICATORS ----------
+function ema(v,n){ if(!v.length) return []; const k=2/(n+1); const out=[v[0]]; for(let i=1;i<v.length;i++) out.push(v[i]*k+out[i-1]*(1-k)); return out; }
+function rsi(c,n=14){
+  if(c.length<n+1) return new Array(c.length).fill(50);
+  const g=new Array(c.length).fill(0), l=new Array(c.length).fill(0);
+  for(let i=1;i<c.length;i++){ const d=c[i]-c[i-1]; if(d>0) g[i]=d; else l[i]=-d; }
+  let ag=0,al=0; for(let i=1;i<=n;i++){ag+=g[i];al+=l[i];} ag/=n; al/=n;
+  const out=new Array(c.length).fill(50);
+  for(let i=n+1;i<c.length;i++){ ag=(ag*(n-1)+g[i])/n; al=(al*(n-1)+l[i])/n; out[i]= al>0 ? 100-100/(1+ag/al) : 100; }
+  return out;
+}
+function atr(cd,n=14){
+  if(cd.length<n+1) return new Array(cd.length).fill(0);
+  const tr=new Array(cd.length).fill(0);
+  for(let i=1;i<cd.length;i++){ const h=cd[i].h,l=cd[i].l,pc=cd[i-1].c; tr[i]=Math.max(h-l,Math.abs(h-pc),Math.abs(l-pc)); }
+  const out=new Array(cd.length).fill(0); let a=0; for(let i=1;i<=n;i++) a+=tr[i]; a/=n; out[n]=a;
+  for(let i=n+1;i<cd.length;i++){ a=(a*(n-1)+tr[i])/n; out[i]=a; }
+  return out;
+}
+function vwap(cd){
+  let pv=0, vv=0; const out=[];
+  for(const c of cd){ const tp=(c.h+c.l+c.c)/3; const v=Math.max(c.v,1); pv+=tp*v; vv+=v; out.push(pv/vv); }
+  return out;
+}
+
+// ---------- SIGNAL ----------
+function evaluate(sym, cd){
+  if(cd.length<30) return {action:"NO_TRADE",conf:0,reasons:["no data"]};
+  const closes = cd.map(x=>x.c), vols = cd.map(x=>x.v);
+  const e9=ema(closes,9), e21=ema(closes,21), e12=ema(closes,12), e26=ema(closes,26);
+  const macd=closes.map((_,i)=>e12[i]-e26[i]); const msig=ema(macd,9);
+  const r=rsi(closes), a=atr(cd), vw=vwap(cd);
+  const i=cd.length-1; const price=closes[i];
+  let score=0; const reasons=[];
+  if(e9[i]>e21[i]){score+=0.15;reasons.push("EMA9>21");} else {score-=0.15;reasons.push("EMA9<21");}
+  if(macd[i]>msig[i]){score+=0.15;reasons.push("MACD+");} else {score-=0.15;reasons.push("MACD-");}
+  if(r[i]>40&&r[i]<70){score+=0.10;reasons.push("RSI"+r[i].toFixed(0));}
+  if(r[i]>75||r[i]<30){score-=0.10;reasons.push("RSIex");}
+  if(price>vw[i]){score+=0.10;reasons.push(">VWAP");} else {score-=0.10;reasons.push("<VWAP");}
+  const avgV = vols.slice(-20).reduce((a,b)=>a+b,0)/Math.min(vols.length,20);
+  const vr = avgV>0 ? vols[i]/avgV : 1;
+  if(vr>1.3){score+=0.15;reasons.push("Vol x"+vr.toFixed(1));}
+  const atrPct = price ? a[i]/price*100 : 0;
+  if(atrPct>0.15) score+=0.05;
+  const conf = Math.min(Math.abs(score),1);
+  let action = conf>=CFG.min_conf ? (score>0?"BUY":"SELL") : "NO_TRADE";
+  if(vr<0.7){action="NO_TRADE";reasons.push("LowVol");}
+  if(atrPct<0.05){action="NO_TRADE";reasons.push("DeadATR");}
+  const last=lastFire[sym]; if(action!="NO_TRADE"&&last&&(Date.now()-last)<CFG.cooldown_min*60000){action="NO_TRADE";reasons.push("Cooldown");}
+  let sl=0,tgt=0,qty=0;
+  if(action!="NO_TRADE"&&a[i]>0){
+    if(action=="BUY"){sl=price-1.5*a[i];tgt=price+3*a[i];}
+    else{sl=price+1.5*a[i];tgt=price-3*a[i];}
+    const riskAmt = CFG.capital * CFG.risk_pct/100;
+    const ps=Math.abs(price-sl); qty = ps>0 ? Math.max(1,Math.floor(riskAmt/ps)) : 1;
+  }
+  if(action!="NO_TRADE") lastFire[sym]=Date.now();
+  return {action,conf:+conf.toFixed(2),price:+price.toFixed(2),sl:+sl.toFixed(2),tgt:+tgt.toFixed(2),qty,reasons,vr,atrPct};
+}
+
+// ---------- GAMMA ----------
+function gammaCheck(sym,cd){
+  const now = new Date();
+  const hm = now.getHours().toString().padStart(2,"0")+":"+now.getMinutes().toString().padStart(2,"0");
+  if(hm < CFG.gamma_start) return null;
+  if(cd.length<12) return null;
+  const vols=cd.map(c=>c.v);
+  const avgV = vols.slice(-20).reduce((a,b)=>a+b,0)/Math.min(vols.length,20);
+  const vr = avgV>0?vols[vols.length-1]/avgV:1;
+  const recent=cd.slice(-10).map(c=>c.c);
+  const mn=Math.min(...recent),mx=Math.max(...recent);
+  const mean=recent.reduce((a,b)=>a+b,0)/recent.length;
+  const rng=(mx-mn)/mean;
+  let score=0; const trig=[];
+  if(vr>2){score+=0.30;trig.push("Vol x"+vr.toFixed(1));}
+  if(rng<0.004){score+=0.25;trig.push("Coiling");}
+  if(score<0.5) return null;
+  return {prob:+Math.min(score,0.9).toFixed(2),triggers:trig,sym};
+}
+
+// ---------- TELEGRAM ----------
+async function tg(title,msg){
+  if(!CFG.tg_token||!CFG.tg_chat) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${CFG.tg_token}/sendMessage`,{
+      method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({chat_id:CFG.tg_chat,text:`*${title}*\n${msg}`,parse_mode:"Markdown"})
+    });
+  } catch(e){}
+}
+
+// ---------- UI ----------
+function log(msg){
+  const el=document.getElementById("log");
+  const ts=new Date().toTimeString().slice(0,8);
+  const d=document.createElement("div");
+  d.textContent=`[${ts}] ${msg}`;
+  el.insertBefore(d,el.firstChild);
+  while(el.children.length>200) el.removeChild(el.lastChild);
+}
+function addSignal(s){
+  const box=document.getElementById("signals");
+  if(box.querySelector(".empty")) box.innerHTML="";
+  const row=document.createElement("div");
+  row.className="row "+(s.action=="BUY"?"buy":"sell");
+  row.innerHTML=`
+    <div>${new Date().toTimeString().slice(0,5)}</div>
+    <div><b>${s.symbol}</b></div>
+    <div style="color:${s.action=="BUY"?"#00e0a0":"#ff6060"}"><b>${s.action}</b></div>
+    <div>${s.conf}</div>
+    <div>${s.price}<br><small style="color:#888">SL:${s.sl} T:${s.tgt}</small></div>
+    <div>${s.qty}</div>`;
+  box.insertBefore(row,box.firstChild);
+}
+function addGamma(g){
+  const box=document.getElementById("gammas");
+  if(box.querySelector(".empty")) box.innerHTML="";
+  const row=document.createElement("div");
+  row.className="row gb";
+  row.innerHTML=`
+    <div>${new Date().toTimeString().slice(0,5)}</div>
+    <div><b>${g.sym}</b></div>
+    <div style="color:#ffcc00">⚠</div>
+    <div>${g.prob}</div>
+    <div>${g.triggers.join(", ")}</div>
+    <div>—</div>`;
+  box.insertBefore(row,box.firstChild);
+}
+function tab(name){
+  document.querySelectorAll(".tab").forEach(t=>t.classList.toggle("active",t.textContent.toLowerCase().includes(name)));
+  document.querySelectorAll(".pane").forEach(p=>p.style.display="none");
+  document.getElementById("pane-"+name).style.display="block";
+}
+function toggleConfig(){
+  document.getElementById("cfg").classList.toggle("show");
+  if(document.getElementById("cfg").classList.contains("show")){
+    document.getElementById("cfg_token").value=CFG.tg_token;
+    document.getElementById("cfg_chat").value=CFG.tg_chat;
+    document.getElementById("cfg_cap").value=CFG.capital;
+    document.getElementById("cfg_int").value=CFG.interval;
+  }
+}
+function saveCfg(){
+  CFG.tg_token=document.getElementById("cfg_token").value.trim();
+  CFG.tg_chat=document.getElementById("cfg_chat").value.trim();
+  CFG.capital=+document.getElementById("cfg_cap").value||100000;
+  CFG.interval=+document.getElementById("cfg_int").value||60;
+  localStorage.setItem("ta_cfg",JSON.stringify(CFG));
+  log("Config saved");
+  toggleConfig();
+}
+
+// ---------- SCAN LOOP ----------
+async function scanOnce(){
+  log("Scanning "+CFG.watchlist.length+" symbols...");
+  for(const sym of CFG.watchlist){
+    if(!running) return;
+    try {
+      const cd = await fetchCandles(sym);
+      if(!cd.length) continue;
+      const sig = evaluate(sym,cd);
+      if(sig.action!="NO_TRADE"){
+        const row = {...sig, symbol:sym};
+        addSignal(row);
+        tg(sig.action+" "+sym, `Conf: ${sig.conf}\nPrice: ${sig.price}\nSL: ${sig.sl}\nTGT: ${sig.tgt}\nQty: ${sig.qty}`);
+        log(`📈 ${sig.action} ${sym} @ ${sig.price} conf=${sig.conf}`);
+      }
+      const g = gammaCheck(sym,cd);
+      if(g){ addGamma(g); tg("GAMMA BLAST WATCH",`${sym}\nProb: ${g.prob}\n${g.triggers.join(", ")}`); log(`⚠️ GAMMA ${sym} prob=${g.prob}`); }
+      await new Promise(r=>setTimeout(r,200));
+    } catch(e){ log("err "+sym+": "+e.message); }
+  }
+  log("Scan complete");
+}
+function toggleScan(){
+  running = !running;
+  const btn = document.getElementById("scanBtn");
+  if(running){
+    btn.textContent = "■ Stop";
+    btn.className = "off";
+    log("Scan started");
+    scanOnce();
+    scanTimer = setInterval(scanOnce, CFG.interval*1000);
+  } else {
+    btn.textContent = "▶ Scan";
+    btn.className = "";
+    clearInterval(scanTimer);
+    log("Scan stopped");
+  }
+}
+document.getElementById("broker").value = CFG.broker || "none";
+document.getElementById("broker").addEventListener("change",e=>{CFG.broker=e.target.value;localStorage.setItem("ta_cfg",JSON.stringify(CFG));});
+log("Ready — paper mode. Tap ⚙ to configure Telegram.");
+</script>
+</body>
+</html>
